@@ -1,0 +1,1180 @@
+"""卡片渲染回归测试：覆盖 tieba_core.card 设计系统的主题、布局与排版行为。
+
+约定两条：
+
+* 「某段文字有没有画在卡片上」一律通过 ``RenderContext.texts`` 采集后断言，
+  绝不去猜坐标或做像素 OCR；
+* 几何断言一律基于真实渲染出的 PIL 图像与真实绘制调用，不依赖硬编码尺寸。
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import pytest
+from PIL import Image
+
+from tieba_core.card import (
+    AUTO_THEME_KEY,
+    LAYOUT_KEYS,
+    PLATFORM_THEMES,
+    THEME_KEYS,
+    THEMES,
+    build_model,
+    is_auto_theme,
+    normalize_comments,
+    resolve_theme_key_for_platform,
+)
+from tieba_core.card import blocks as card_blocks
+from tieba_core.card import engine as card_engine
+from tieba_core.card import surface as card_surface
+from tieba_core.card.typeset import TypeSetter
+from tieba_core.rika_render.adapter import _split_author_label
+from tieba_core.rika_render.data import Author, ParseResult, Platform
+from tieba_core.rika_render.render import (
+    DEFAULT_WATERMARK_TAG,
+    LAYOUT_NAMES,
+    SKIN_NAMES,
+    ShareCardRenderer,
+)
+
+#: 深浅两种模式
+MODES = ("dark", "light")
+
+#: 主题 x 模式矩阵的渲染宽度（够宽以容纳评论与统计，又不至于太慢）
+MATRIX_WIDTH = 640
+
+#: 一条协议 + 查询参数 + 片段都齐全的长链接（150 字符，必须折行而非截断）
+FULL_URL = (
+    "https://www.bilibili.com/video/BV1Ex421c7mQ/"
+    "?vd_source=abcdef0123456789abcdef0123456789"
+    "&spm_id_from=333.1007.tianma.1-1-1.click&extra=1#reply987654321"
+)
+
+
+# ============================ 采集工具 ============================
+
+
+@dataclass
+class Probe:
+    """一次完整渲染的采集结果：成品图 + 实际绘制的文本 + 实际贴图尺寸。"""
+
+    image: Any
+    texts: list[str] = field(default_factory=list)
+    tiles: list[tuple[str, int, int]] = field(default_factory=list)
+    text_bottoms: list[int] = field(default_factory=list)
+    #: 每次真实绘字的 (文本, x, y, 颜色)，用于断言位置与配色
+    draws: list[tuple[str, int, int, Any]] = field(default_factory=list)
+    ctx: Any = None
+
+    @property
+    def joined_text(self) -> str:
+        return "\n".join(self.texts)
+
+    @property
+    def digest(self) -> str:
+        return hashlib.md5(self.image.tobytes()).hexdigest()
+
+
+def render_probe(
+    model: Any,
+    *,
+    width: int = 800,
+    mode: str = "dark",
+    theme_key: str = "aurora",
+    layout_key: str = "standard",
+) -> Probe:
+    """走一遍 render_card_image 的完整流程，并顺带采集文本、贴图与文字底边。
+
+    engine.build_context 被临时换成间谍版本，好处是能拿到引擎自己创建的
+    RenderContext（沉浸布局下正文用的是第二个 ctx，但两者共享同一个 texts 列表）。
+    """
+    contexts: list[Any] = []
+    tiles: list[tuple[str, int, int]] = []
+    bottoms: list[int] = []
+    draws: list[tuple[str, int, int, Any]] = []
+
+    real_build_context = card_engine.build_context
+    real_tile_image = card_blocks._tile_image
+    real_draw_line = TypeSetter.draw_line
+
+    def spy_build_context(*args: Any, **kwargs: Any) -> Any:
+        ctx = real_build_context(*args, **kwargs)
+        contexts.append(ctx)
+        return ctx
+
+    def spy_tile_image(ctx: Any, item: Any, w: int, h: int, **kwargs: Any) -> Any:
+        tiles.append((Path(item.path).name, int(w), int(h)))
+        return real_tile_image(ctx, item, w, h, **kwargs)
+
+    def spy_draw_line(self: Any, draw: Any, xy: Any, text: str, font: Any, fill: Any, **kwargs: Any) -> Any:
+        if text:
+            bottoms.append(int(xy[1]) + self.line_height(font, 1.0))
+            draws.append((str(text), int(xy[0]), int(xy[1]), fill))
+        return real_draw_line(self, draw, xy, text, font, fill, **kwargs)
+
+    card_engine.build_context = spy_build_context
+    card_blocks._tile_image = spy_tile_image
+    TypeSetter.draw_line = spy_draw_line
+    try:
+        image = card_engine.render_card_image(
+            model,
+            width=width,
+            mode=mode,
+            theme_key=theme_key,
+            layout_key=layout_key,
+        )
+    finally:
+        card_engine.build_context = real_build_context
+        card_blocks._tile_image = real_tile_image
+        TypeSetter.draw_line = real_draw_line
+
+    return Probe(
+        image=image,
+        texts=list(contexts[0].texts),
+        tiles=tiles,
+        text_bottoms=bottoms,
+        draws=draws,
+        ctx=contexts[0],
+    )
+
+
+def png(path: Path, size: tuple[int, int], color: tuple[int, int, int]) -> Path:
+    """生成一张纯色测试图并返回路径。"""
+    Image.new("RGB", size, color).save(path)
+    return path
+
+
+def make_result(
+    *,
+    title: str | None = "标题",
+    text: str | None = "正文",
+    url: str = "https://x.com/i/status/2090756349701554395",
+    platform: str = "twitter",
+    display_name: str = "推特",
+    author: tuple[str, str] | None = ("Pekachow (Amber)", "@Pekachow1"),
+    timestamp: int | None = 1_756_000_000,
+    extra: dict[str, Any] | None = None,
+) -> ParseResult:
+    """构造一个用于渲染的 ParseResult。"""
+    payload: dict[str, Any] = {"content_type": "图文"}
+    payload.update(extra or {})
+    return ParseResult(
+        platform=Platform(name=platform, display_name=display_name),
+        author=Author(name=author[0], description=author[1]) if author else None,
+        title=title,
+        text=text,
+        timestamp=timestamp,
+        url=url,
+        extra=payload,
+    )
+
+
+# ============================ 素材与矩阵夹具 ============================
+
+
+@pytest.fixture(scope="module")
+def assets(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    """一组只生成一次的测试素材（头像、竖图、横图、九宫格图集）。"""
+    root = tmp_path_factory.mktemp("card-assets")
+    return {
+        "avatar": png(root / "avatar.png", (180, 180), (70, 190, 240)),
+        "tall": png(root / "tall.png", (900, 1100), (242, 126, 164)),
+        "wide": png(root / "wide.png", (1200, 700), (37, 83, 211)),
+        "gallery": [
+            png(
+                root / f"gallery-{index}.png",
+                (720 + index * 30, 620 + index * 40),
+                (40 + index * 20, 90 + index * 12, 200 - index * 18),
+            )
+            for index in range(9)
+        ],
+    }
+
+
+@pytest.fixture(scope="module")
+def rich_model(assets: dict[str, Any]) -> Any:
+    """含标题、正文、统计、两条评论与两张图的完整卡片模型。"""
+    result = make_result(
+        title="A translated title with enough words to verify responsive wrapping",
+        text=(
+            "This is a body paragraph used to verify layout and text rendering. "
+            "It should remain readable without overlapping the author block."
+        ),
+        extra={
+            "stats_line": "👍 128 💬 16 🔁 8",
+            "hot_comments": [
+                {
+                    "username": "A reader with a long public display name",
+                    "uid": "reader-10001",
+                    "likes": 42,
+                    "time": "2026-08-24 12:30:00",
+                    "message": "A translated public reply rendered inside the same card.",
+                },
+                {
+                    "username": "Second reader",
+                    "uid": "reader-10002",
+                    "likes": 9,
+                    "time": "2026-08-24 12:31:00",
+                    "message": "Another reply verifies the comment panel height.",
+                },
+            ],
+        },
+    )
+    return build_model(
+        result,
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["tall"], assets["wide"]]},
+        watermark="Alice解析",
+    )
+
+
+@pytest.fixture(scope="module")
+def matrix(rich_model: Any) -> dict[tuple[str, str], Probe]:
+    """把 6 主题 x 深浅 2 模式各渲染一次，供多个断言复用（只渲染 12 张）。"""
+    return {
+        (theme, mode): render_probe(rich_model, width=MATRIX_WIDTH, mode=mode, theme_key=theme)
+        for theme in THEME_KEYS
+        for mode in MODES
+    }
+
+
+# ============================ 兼容层 API ============================
+
+
+def test_author_label_splits_name_and_identifier() -> None:
+    """作者标签里的显示名与账号标识必须被正确拆开。"""
+    assert _split_author_label("Pekachow (Amber) (@Pekachow1)") == (
+        "Pekachow (Amber)",
+        "@Pekachow1",
+    )
+    assert _split_author_label("Alice(uid:10001)") == ("Alice", "uid:10001")
+
+
+def test_legacy_shim_reexports_design_system_enums() -> None:
+    """兼容 shim 的枚举必须直接来自设计系统，避免两处漂移。"""
+    assert LAYOUT_NAMES == LAYOUT_KEYS == ("standard", "magazine", "immersive", "feed")
+    assert SKIN_NAMES == THEME_KEYS
+    assert SKIN_NAMES == (
+        "aurora",
+        "broadsheet",
+        "telemetry",
+        "gallery",
+        "nocturne",
+        "bilibili",
+        "x",
+        "youtube",
+    )
+    assert DEFAULT_WATERMARK_TAG
+
+
+# ============================ 主题 x 模式矩阵 ============================
+
+
+@pytest.mark.parametrize("theme", THEME_KEYS)
+@pytest.mark.parametrize("mode", MODES)
+def test_theme_and_mode_render_a_non_blank_card(
+    matrix: dict[tuple[str, str], Probe], theme: str, mode: str
+) -> None:
+    """每个主题的深浅两版都要画出内容非空白、宽度等于请求宽度的卡片。"""
+    probe = matrix[(theme, mode)]
+    image = probe.image
+    assert image.mode == "RGB"
+    assert image.width == MATRIX_WIDTH
+    assert image.height > MATRIX_WIDTH // 2
+    assert any(low != high for low, high in image.getextrema()), f"{theme}/{mode} 输出是纯色空白"
+    assert probe.texts, f"{theme}/{mode} 没有画出任何文字"
+
+
+def test_theme_and_mode_matrix_is_pairwise_distinct(matrix: dict[tuple[str, str], Probe]) -> None:
+    """6 主题 x 深浅 2 模式共 12 张图必须互不相同（主题与模式都真正生效）。"""
+    digests = {key: probe.digest for key, probe in matrix.items()}
+    assert len(set(digests.values())) == len(digests), f"存在重复输出: {digests}"
+
+
+@pytest.mark.parametrize("theme", THEME_KEYS)
+@pytest.mark.parametrize("mode", MODES)
+def test_no_text_is_clipped_at_the_card_bottom(
+    matrix: dict[tuple[str, str], Probe], theme: str, mode: str
+) -> None:
+    """所有文字的底边都必须落在画布内，且卡片底部要留出合理白边。"""
+    probe = matrix[(theme, mode)]
+    height = probe.image.height
+    assert probe.text_bottoms
+    lowest = max(probe.text_bottoms)
+    assert lowest < height, f"{theme}/{mode} 底部文字被裁掉"
+    assert height - lowest >= 16, f"{theme}/{mode} 底部留白只有 {height - lowest}px"
+
+
+@pytest.mark.parametrize("width", (520, 800, 1080))
+def test_output_width_follows_the_request(rich_model: Any, width: int) -> None:
+    """成品图宽度必须严格等于请求宽度。"""
+    probe = render_probe(rich_model, width=width, theme_key="aurora", layout_key="standard")
+    assert probe.image.width == width
+
+
+# ============================ 主题 / 布局必须真正生效 ============================
+
+
+def test_theme_and_layout_changes_produce_different_cards_and_cache_paths(
+    assets: dict[str, Any], tmp_path: Path
+) -> None:
+    """深浅 2 x 主题 8 x 布局 4 = 64 种组合必须张张不同，缓存路径也必须张张不同。
+
+    这条用例是旧断言「高级皮肤忽略主题与布局」的反转：新架构下三者都真正生效。
+    """
+    result = make_result(title="真实标题", text="正文")
+    model = build_model(
+        result,
+        {"avatar": None, "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+
+    digests: dict[str, tuple[str, str, str]] = {}
+    cache_paths: dict[Path, tuple[str, str, str]] = {}
+    for mode in MODES:
+        for theme in THEME_KEYS:
+            for layout in LAYOUT_KEYS:
+                combo = (mode, theme, layout)
+                probe = render_probe(
+                    model, width=520, mode=mode, theme_key=theme, layout_key=layout
+                )
+                assert probe.digest not in digests, f"{combo} 与 {digests.get(probe.digest)} 输出相同"
+                digests[probe.digest] = combo
+
+                renderer = ShareCardRenderer(
+                    cache_dir=tmp_path, skin=theme, theme=mode, layout=layout, width=520
+                )
+                path = renderer._output_path("same-card", result)
+                assert path not in cache_paths, f"{combo} 与 {cache_paths.get(path)} 缓存路径相同"
+                cache_paths[path] = combo
+
+    assert len(digests) == len(cache_paths) == 2 * len(THEME_KEYS) * len(LAYOUT_KEYS) == 64
+
+
+# ============================ 媒体编排 ============================
+
+
+@pytest.mark.parametrize("theme", THEME_KEYS)
+def test_second_image_gets_substantial_area(assets: dict[str, Any], theme: str) -> None:
+    """两图卡片里的第二张图必须拿到实质面积，不能被压成缩略角标。"""
+    model = build_model(
+        make_result(title=None, text="两张图片都应当是主要内容。"),
+        {"avatar": None, "hero": None, "grid": [assets["tall"], assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=800, theme_key=theme)
+
+    second = [(w, h) for name, w, h in probe.tiles if name == Path(assets["wide"]).name]
+    assert second, f"{theme} 没有绘制第二张图"
+    assert max(w * h for w, h in second) >= 60_000, f"{theme} 第二张图面积过小: {second}"
+
+
+def test_telemetry_numbers_both_media_windows(assets: dict[str, Any]) -> None:
+    """telemetry 主题的两图布局要左右并排，并给两个媒体窗都打上 01/02 编号。"""
+    model = build_model(
+        make_result(title=None, text="遥测双图窗口。"),
+        {"avatar": None, "hero": None, "grid": [assets["tall"], assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=800, theme_key="telemetry")
+
+    assert THEMES["telemetry"].caption_numbering is True
+    assert "01/02" in probe.texts
+    assert "02/02" in probe.texts
+    tiles = [(w, h) for _, w, h in probe.tiles]
+    assert len(tiles) == 2
+    assert tiles[0][1] == tiles[1][1], f"两图不等高，说明没走并排布局: {tiles}"
+    assert min(w for w, _ in tiles) > 800 // 3
+
+
+@pytest.mark.parametrize("theme", THEME_KEYS)
+def test_many_images_render_on_every_theme_with_immersive_layout(
+    assets: dict[str, Any], theme: str
+) -> None:
+    """9 张图 + 沉浸布局在所有主题下都要正常出图，不崩也不失控地拉长。"""
+    model = build_model(
+        make_result(title=None, text="多图布局回归测试。"),
+        {"avatar": None, "hero": None, "grid": assets["gallery"]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=520, theme_key=theme, layout_key="immersive")
+    image = probe.image
+
+    assert image.width == 520
+    assert 600 < image.height < 5000, f"{theme} 高度异常: {image.height}"
+    assert any(low != high for low, high in image.getextrema())
+    assert len(probe.tiles) >= 9, f"{theme} 只画了 {len(probe.tiles)} 张图"
+
+
+# ============================ 文本排版 ============================
+
+
+def test_hot_comment_is_limited_to_sixty_characters(tmp_path: Path) -> None:
+    """评论正文按 60 字符硬截断并以省略号收尾，截断后才参与换行。"""
+    result = make_result(
+        title=None,
+        text=None,
+        extra={"hot_comments": [{"username": "Reader", "message": "很长的评论内容" * 40}]},
+    )
+
+    message = normalize_comments(result, 60)[0].message
+    assert len(message) == 60
+    assert message.endswith("…")
+
+    renderer = ShareCardRenderer(cache_dir=tmp_path, width=520, hot_comment_max_chars=60)
+    shim_message = renderer._normalized_card_comments(result)[0]["message"]
+    assert shim_message == message
+    assert "".join(renderer._wrap(shim_message, renderer._font(17), 300)) == message
+
+
+def test_wrap_keeps_short_ascii_words_intact(tmp_path: Path) -> None:
+    """换行不能把短 ASCII 单词劈开，但长链接必须逐字符完整保留。"""
+    renderer = ShareCardRenderer(cache_dir=tmp_path, width=520)
+    font = renderer._font(20)
+    prefix = "为什么 "
+    max_width = renderer._text_width(prefix + "H", font)
+
+    lines = renderer._wrap(prefix + "HAL 在下一部作品", font, max_width)
+    assert lines[0][-1:] != "H"
+    assert any(line.startswith("HAL") for line in lines)
+
+    long_url = "https://example.com/" + "a" * 120
+    assert "".join(renderer._wrap(long_url, font, max_width)) == long_url
+
+
+#: 仿站皮肤：页脚是站点自己的操作栏，链接被收进顶栏右上角的署名行。
+SITE_THEME_KEYS = ("bilibili", "x", "youtube")
+
+#: 其余皮肤的页脚承载完整链接。
+FOOTER_URL_THEME_KEYS = tuple(key for key in THEME_KEYS if key not in SITE_THEME_KEYS)
+
+
+@pytest.mark.parametrize("layout", LAYOUT_KEYS)
+def test_footer_draws_protocol_query_and_fragment(assets: dict[str, Any], layout: str) -> None:
+    """四种布局的页脚都要画出完整链接：协议、查询参数与片段一个字符都不许丢。
+
+    三套仿站皮肤（bilibili / x / youtube）是例外：它们仿的是站点详情页，链接被压进
+    顶栏右上角的署名行，行为由
+    :func:`test_bilibili_tucks_the_link_into_the_top_right_credit_line` 单独覆盖。
+    """
+    model = build_model(
+        make_result(
+            title="完整链接测试",
+            text="四种布局都必须绘制完整协议、查询参数和片段。",
+            url=FULL_URL,
+            platform="bilibili",
+            display_name="哔哩哔哩",
+        ),
+        {"avatar": None, "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+    for theme in FOOTER_URL_THEME_KEYS:
+        probe = render_probe(model, width=800, theme_key=theme, layout_key=layout)
+        drawn = "".join(probe.texts)
+        assert not any("http" in text and text.endswith("…") for text in probe.texts), (
+            f"{theme}/{layout} 把链接省略号截断了：{probe.texts}"
+        )
+        assert FULL_URL in drawn, (
+            f"{theme}/{layout} 布局丢失了链接片段，实际绘制：{probe.texts}"
+        )
+
+
+@pytest.mark.parametrize("layout", LAYOUT_KEYS)
+def test_bilibili_tucks_the_link_into_the_top_right_credit_line(
+    assets: dict[str, Any], layout: str
+) -> None:
+    """bilibili 皮肤把超长链接收进顶栏右上角：允许省略，但域名必须还认得出来。"""
+    model = build_model(
+        make_result(
+            title="完整链接测试",
+            text="链接收在顶栏右上角，不再占用页脚。",
+            url=FULL_URL,
+            platform="bilibili",
+            display_name="哔哩哔哩",
+        ),
+        {"avatar": None, "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=800, theme_key="bilibili", layout_key=layout)
+
+    credits = [text for text in probe.texts if "bilibili.com" in text]
+    assert credits, f"{layout} 顶栏丢了来源链接：{probe.texts}"
+    credit = credits[0]
+    assert "Alice解析" in credit, "署名应与链接同处一行"
+    assert credit.startswith("bilibili.com/video/"), (
+        f"链接应剥掉协议头与 www. 后从域名开始：{credit!r}"
+    )
+    assert "…" in credit, "超长链接在顶栏里应被省略而不是撑破版面"
+
+
+def test_bilibili_theme_has_no_fixed_style_watermark(assets: dict[str, Any]) -> None:
+    """bilibili 主题只做视觉仿站，不允许出现固定文案水印。"""
+    model = build_model(
+        make_result(title=None, text="正文先于媒体展示。"),
+        {"avatar": None, "hero": None, "grid": [assets["tall"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=720, theme_key="bilibili")
+
+    assert "推特" in probe.texts, "顶栏应写真实来源而不是风格名"
+    assert "哔哩哔哩风格" not in probe.joined_text
+    assert "B站动态" not in probe.joined_text
+    assert "bilibili" not in probe.texts
+
+
+@pytest.mark.parametrize("theme", THEME_KEYS)
+def test_titleless_social_post_promotes_body_once(assets: dict[str, Any], theme: str) -> None:
+    """无标题的社交贴文里，正文只被提升为标题绘制一次，且不出现占位标题。"""
+    body = "星星眼很可爱"
+    model = build_model(
+        make_result(title=None, text=body),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["tall"]]},
+        watermark="Alice解析",
+    )
+    assert model.has_real_title is False
+    assert model.title == body and model.body == ""
+
+    probe = render_probe(model, width=520, theme_key=theme)
+    assert probe.texts.count(body) == 1, f"{theme} 把正文画了 {probe.texts.count(body)} 次"
+    assert not [t for t in probe.texts if "UNTITLED" in t or "未命名" in t]
+
+
+# ============================ 兼容层落盘 ============================
+
+
+def test_render_sync_writes_png_and_avatar_changes_the_output(
+    assets: dict[str, Any], tmp_path: Path
+) -> None:
+    """兼容层 _render_sync 要能落盘出图，且有无头像必须产出不同的卡片。"""
+    result = make_result(title="落盘测试", text="正文")
+    renderer = ShareCardRenderer(
+        cache_dir=tmp_path, skin="aurora", theme="dark", width=720, watermark="Alice解析"
+    )
+    with_avatar = tmp_path / "with-avatar.png"
+    without_avatar = tmp_path / "without-avatar.png"
+
+    renderer._render_sync(
+        result, {"avatar": assets["avatar"], "hero": None, "grid": [assets["wide"]]}, with_avatar
+    )
+    renderer._render_sync(
+        result, {"avatar": None, "hero": None, "grid": [assets["wide"]]}, without_avatar
+    )
+
+    assert with_avatar.is_file() and without_avatar.is_file()
+    with Image.open(with_avatar) as image:
+        assert image.width == 720
+    assert with_avatar.read_bytes() != without_avatar.read_bytes()
+
+# ============================ 哔哩哔哩仿站结构 ============================
+
+
+@pytest.fixture(scope="module")
+def bili_model(assets: dict[str, Any]) -> Any:
+    """一条贴近 B 站手机端动态详情页的样本：九图 + IP 属地 + 带头像热评 + emoji 统计行。"""
+    result = make_result(
+        title=None,
+        text="#凡人慕兰之战# 正文用于验证富文本与话题着色 @凡人修仙传官方 https://b23.tv/abcdef",
+        url="https://t.bilibili.com/1234567890",
+        platform="bilibili",
+        display_name="哔哩哔哩",
+        author=("凡人修仙传", "@fanrenxiuxianzhuan"),
+        extra={
+            "stats_line": "\U0001f44d 361 \U0001fa99 1024 \u2b50 876 \u21a9\ufe0f 208 \U0001f4ac 33 \U0001f440 12.3万 \U0001f4ad 4562",
+            "ip_location": "北京",
+            "hot_comments": [
+                {
+                    "username": "热评用户甲",
+                    "uid": "10001",
+                    "likes": 41,
+                    "time": "8月22日 江苏",
+                    "message": "第一条热门评论内容。",
+                },
+                {
+                    "username": "热评用户乙",
+                    "uid": "10002",
+                    "likes": 9,
+                    "time": "8月22日 北京",
+                    "message": "第二条热门评论内容。",
+                },
+            ],
+        },
+    )
+    return build_model(
+        result,
+        {
+            "avatar": assets["avatar"],
+            "hero": None,
+            "grid": assets["gallery"],
+            "comment_avatars": {0: assets["avatar"], 1: assets["avatar"]},
+        },
+        watermark="Alice解析",
+    )
+
+
+def test_bilibili_nine_grid_tiles_are_uniform_squares(bili_model: Any) -> None:
+    """B 站九宫格必须是等高等宽的正方格，不能因为末行不足而被拉伸。"""
+    probe = render_probe(bili_model, width=800, theme_key="bilibili", layout_key="feed")
+
+    assert len(probe.tiles) == 9, f"九图应贴 9 格，实际 {len(probe.tiles)}"
+    heights = {h for _, _, h in probe.tiles}
+    widths = [w for _, w, _ in probe.tiles]
+    assert len(heights) == 1, f"格子高度不一致：{sorted(heights)}"
+    # 列宽按整数像素分配，末列允许 1px 的取整补偿。
+    assert max(widths) - min(widths) <= 1, f"格子宽度差过大：{sorted(widths)}"
+    assert abs(max(widths) - max(heights)) <= 2, "九宫格应接近正方形"
+
+
+def test_bilibili_tabbar_merges_like_and_share_like_native(bili_model: Any) -> None:
+    """页签条照抄 B 站原版：「评论 N」+「赞和转发 M」，M 是点赞与转发之和。"""
+    probe = render_probe(bili_model, width=800, theme_key="bilibili", layout_key="feed")
+
+    assert "评论 33" in probe.texts
+    # 样本统计行里点赞 361、转发 208，原版页签显示两者相加。
+    assert "赞和转发 569" in probe.texts
+    assert not [t for t in probe.texts if t.startswith("转发 ")], (
+        f"不该再出现独立的转发页签：{probe.texts}"
+    )
+
+
+def test_bilibili_tabbar_falls_back_to_the_single_available_count(
+    assets: dict[str, Any],
+) -> None:
+    """只拿到点赞数时，合并页签就显示这一个数字，不留空也不编造。"""
+    model = build_model(
+        make_result(
+            title=None,
+            text="只有点赞数的动态。",
+            platform="bilibili",
+            display_name="哔哩哔哩",
+            extra={"stats_line": "\U0001f44d 361"},
+        ),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=800, theme_key="bilibili", layout_key="feed")
+
+    assert "赞和转发 361" in probe.texts
+
+
+def test_bilibili_tabbar_hides_secondary_without_any_count(
+    assets: dict[str, Any],
+) -> None:
+    """点赞与转发都拿不到时整枚次级页签隐藏：既不吐 0，也不留一个光标签。"""
+    model = build_model(
+        make_result(
+            title=None,
+            text="没有任何互动数据的动态。",
+            platform="bilibili",
+            display_name="哔哩哔哩",
+            extra={"stats_line": "\U0001f4ac 33"},
+        ),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=800, theme_key="bilibili", layout_key="feed")
+
+    assert "评论 33" in probe.texts
+    assert not [t for t in probe.texts if t.startswith("赞和转发")], (
+        f"无数值时不该留下光标签：{probe.texts}"
+    )
+
+
+def test_youtube_chrome_replaces_bilibili_specific_furniture(
+    assets: dict[str, Any],
+) -> None:
+    """哔哩哔哩皮肤套到 YouTube 上时，chrome 必须换件。
+
+    皮肤只定基调（粉色强调 + 详情页骨架），"赞和转发"这个页签和"点我发评论"
+    这个 placeholder 是 B 站自己的说法，YouTube 观看页压根没有页签、输入框写的是
+    "添加评论…"。硬贴过去就是截图里那种出戏的样子。
+    """
+    model = build_model(
+        make_result(
+            title="如果 Ex-Aid 的主题曲被用在名侦探光之美少女里",
+            text=None,
+            platform="youtube",
+            display_name="YouTube",
+            extra={"stats_line": "\U0001f440 12.3\u4e07 \U0001f44d 8547 \U0001f4ac 453"},
+        ),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=800, theme_key="bilibili", layout_key="feed")
+
+    assert "评论 453" in probe.texts
+    assert not [t for t in probe.texts if t.startswith("赞和转发")], (
+        f"YouTube 没有\u300c赞和转发\u300d这一说：{probe.texts}"
+    )
+    assert "点我发评论" not in probe.texts
+    assert "添加评论…" in probe.texts
+    # 操作栏换成 YouTube 的药丸组：点赞数 + 分享 / 保存 两枚带文案的按钮。
+    assert "8547" in probe.texts
+    assert "分享" in probe.texts
+    assert "保存" in probe.texts
+
+
+def test_youtube_corner_credit_uses_the_short_link(assets: dict[str, Any]) -> None:
+    """角落署名把 youtube.com/watch?v=... 折成等价的 youtu.be 短链，省出横向预算。"""
+    model = build_model(
+        make_result(
+            title="标题",
+            text=None,
+            platform="youtube",
+            display_name="YouTube",
+            url="https://www.youtube.com/watch?v=2sm0UuaOm_s",
+        ),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=800, theme_key="bilibili", layout_key="feed")
+
+    credits = [d for d in probe.draws if "Alice解析" in d[0]]
+    assert len(credits) == 1, f"署名应只画一次：{credits}"
+    assert "youtu.be/2sm0UuaOm_s" in credits[0][0]
+    assert "watch?v=" not in credits[0][0]
+
+
+def test_bilibili_topbar_keeps_only_source_title(assets: dict[str, Any]) -> None:
+    """顶栏只留返回箭头 + 来源标题：站点字标、内容类型胶囊、UP主 标记全部不画。"""
+    model = build_model(
+        make_result(text="来自推特的一条动态。", extra={"stats_line": "\u2764\ufe0f 12"}),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=800, theme_key="bilibili", layout_key="feed")
+
+    assert "推特" in probe.texts, "顶栏应写出真实来源"
+    assert "bilibili" not in probe.texts
+    assert "图文" not in probe.texts
+    assert "UP主" not in probe.texts
+
+
+def test_bilibili_credit_line_sits_in_the_top_right_corner(bili_model: Any) -> None:
+    """链接与署名合成一行、收在顶栏右上角，用最小字号的中性灰，不抢正文的戏。"""
+    probe = render_probe(bili_model, width=800, theme_key="bilibili", layout_key="feed")
+
+    credits = [d for d in probe.draws if "Alice解析" in d[0]]
+    assert len(credits) == 1, f"署名应只画一次：{credits}"
+    credit, credit_x, credit_y, credit_fill = credits[0]
+
+    assert "t.bilibili.com/1234567890" in credit, f"链接应与署名同行：{credit!r}"
+    assert credit.index("t.bilibili.com") < credit.index("Alice解析"), "署名排在链接右侧"
+    assert tuple(credit_fill)[:3] == tuple(probe.ctx.ink_muted)[:3], "署名行应用中性灰"
+    assert tuple(credit_fill)[:3] != tuple(probe.ctx.accent_text)[:3], "署名不该用品牌粉"
+
+    # 位置：贴着卡片右上角 —— 横向落在右半区，纵向高于作者名那一行。
+    assert credit_x > probe.image.width // 2, f"署名应贴右侧，实际 x={credit_x}"
+    author = [d for d in probe.draws if d[0] == "凡人修仙传"]
+    assert author, "作者名应被画出"
+    assert credit_y < author[0][2], "署名应在作者行之上（顶栏内）"
+    assert credit_y < probe.image.height // 4, "署名应落在卡片顶部区域"
+
+
+def test_bilibili_bottom_action_bar_is_the_last_thing_drawn(bili_model: Any) -> None:
+    """底部操作栏仿 B 站原版：左侧「点我发评论」药丸 + 右侧四组数字，且位于卡片最底部。"""
+    probe = render_probe(bili_model, width=800, theme_key="bilibili", layout_key="feed")
+
+    hints = [d for d in probe.draws if d[0] == "点我发评论"]
+    assert len(hints) == 1, f"评论药丸文案应只画一次：{hints}"
+    hint_y = hints[0][2]
+
+    # 操作栏右侧四组数字：转发 208 / 评论 33 / 收藏 876 / 点赞 361，全部同排。
+    action_numbers = [d for d in probe.draws if d[0] in {"208", "33", "876", "361"}]
+    assert {d[0] for d in action_numbers} == {"208", "33", "876", "361"}, (
+        f"四组互动数字应齐全：{[d[0] for d in probe.draws]}"
+    )
+    rows = {d[2] for d in action_numbers}
+    assert len(rows) == 1, f"四组数字应在同一行：{sorted(rows)}"
+    assert all(d[1] > hints[0][1] for d in action_numbers), "数字组应排在药丸右侧"
+    assert all(tuple(d[3])[:3] == tuple(probe.ctx.ink_dim)[:3] for d in action_numbers), (
+        "四个数字应统一用次级灰"
+    )
+
+    # 操作栏是卡片最靠下的内容：药丸与数字之下不再有任何文字。
+    lower = [d for d in probe.draws if d[2] > max(rows)]
+    assert not lower, f"操作栏之下不该还有文字：{lower}"
+    assert hint_y > probe.image.height * 0.7, "操作栏应贴卡片底部"
+
+
+@pytest.mark.parametrize("theme", THEME_KEYS)
+@pytest.mark.parametrize("layout", LAYOUT_KEYS)
+def test_watermark_and_url_switches_remove_both_marks(
+    assets: dict[str, Any], theme: str, layout: str
+) -> None:
+    """关掉水印与链接开关后，任何皮肤任何布局都不许再画出署名或链接。"""
+    model = build_model(
+        make_result(
+            title="开关测试",
+            text="水印与链接都被配置关掉了。",
+            url="https://t.bilibili.com/1234567890",
+            platform="bilibili",
+            display_name="哔哩哔哩",
+        ),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+        show_watermark=False,
+        show_url=False,
+    )
+    probe = render_probe(model, width=800, theme_key=theme, layout_key=layout)
+
+    assert "Alice解析" not in probe.joined_text, f"{theme}/{layout} 仍画出了水印"
+    assert "bilibili.com" not in probe.joined_text, f"{theme}/{layout} 仍画出了链接"
+
+
+def test_bilibili_comments_use_native_heading_and_reply_meta(bili_model: Any) -> None:
+    """B 站评论区要有"热门评论"小标题、排序入口，以及"时间 + 回复"的元信息行。"""
+    probe = render_probe(bili_model, width=800, theme_key="bilibili", layout_key="feed")
+
+    assert "热门评论" in probe.texts
+    assert "按热度" in probe.texts
+    assert "8月22日 江苏 回复" in probe.texts
+    assert "热评用户甲" in probe.texts
+
+
+def test_bilibili_ip_note_only_lists_consumption_metrics(bili_model: Any) -> None:
+    """补充说明行只放播放/弹幕这类消费指标，点赞投币收藏留给底部操作栏，避免数字重复。"""
+    probe = render_probe(bili_model, width=800, theme_key="bilibili", layout_key="feed")
+
+    note = [t for t in probe.texts if "播放" in t]
+    assert note, "IP 说明行应画出播放数"
+    line = note[0]
+    assert "弹幕" in line
+    assert "投币" not in line and "收藏" not in line and "点赞" not in line
+
+
+def test_ip_note_block_measures_zero_without_stats(assets: dict[str, Any]) -> None:
+    """没有可显示的消费指标时，补充说明行必须完全不占高度、不绘制。"""
+    model = build_model(
+        make_result(
+            title=None,
+            text="没有统计行的动态。",
+            platform="bilibili",
+            display_name="哔哩哔哩",
+            extra={"stats_line": ""},
+        ),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["tall"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=720, theme_key="bilibili", layout_key="feed")
+
+    assert not [t for t in probe.texts if "播放" in t or "弹幕" in t]
+
+
+# ============================ 统计区块窄栏回归 ============================
+
+
+@pytest.mark.parametrize("theme", ("broadsheet", "nocturne"))
+@pytest.mark.parametrize("width", (520, 640, 800))
+def test_ledger_stats_keep_every_value_readable_in_narrow_columns(
+    assets: dict[str, Any], theme: str, width: int
+) -> None:
+    """账簿式统计在杂志布局的窄侧栏里会被挤成 40px 一格，数值绝不能被省略成空串。"""
+    values = ("361", "1024", "876", "33", "12.3万", "4562")
+    model = build_model(
+        make_result(
+            title="窄栏统计回归",
+            text="杂志布局的侧栏只有整宽的三分之一左右。",
+            extra={
+                "stats_line": (
+                    "\U0001f44d 361 \U0001fa99 1024 \u2b50 876 "
+                    "\u21a9\ufe0f 33 \U0001f440 12.3万 \U0001f4ad 4562"
+                )
+            },
+        ),
+        {"avatar": assets["avatar"], "hero": None, "grid": [assets["wide"]]},
+        watermark="Alice解析",
+    )
+    probe = render_probe(model, width=width, theme_key=theme, layout_key="magazine")
+
+    for value in values:
+        assert value in probe.texts, f"{theme}@{width} 丢了统计值 {value}：{probe.texts}"
+
+
+# ============================ 仿站皮肤：X / YouTube ============================
+
+
+@pytest.fixture(scope="module")
+def x_model(assets: dict[str, Any]) -> Any:
+    """一条贴近 X 单帖页的样本：@handle + 浏览量 + 带头像回复 + emoji 统计行。"""
+    result = make_result(
+        title=None,
+        text="映画『プリキュアオールスターズ』本予告解禁！",
+        url="https://x.com/precure_movie/status/2092446937500860496",
+        platform="twitter",
+        display_name="推特",
+        author=("Pretty Cure Movie", "@precure_movie"),
+        extra={
+            "stats_line": (
+                "\U0001f44d 361 \U0001fa99 1024 \u2b50 876 \u21a9\ufe0f 208 "
+                "\U0001f4ac 33 \U0001f440 12.3万 \U0001f4ad 4562"
+            ),
+            "hot_comments": [
+                {
+                    "username": "热评用户甲",
+                    "uid": "10001",
+                    "likes": 41,
+                    "time": "8月22日 江苏",
+                    "message": "第一条公开回复内容。",
+                },
+                {
+                    "username": "热评用户乙",
+                    "uid": "10002",
+                    "likes": 9,
+                    "time": "8月22日 北京",
+                    "message": "第二条公开回复内容。",
+                },
+            ],
+        },
+    )
+    return build_model(
+        result,
+        {
+            "avatar": assets["avatar"],
+            "hero": None,
+            "grid": [assets["wide"]],
+            "comment_avatars": {0: assets["avatar"], 1: assets["avatar"]},
+        },
+        watermark="Alice解析",
+    )
+
+
+@pytest.fixture(scope="module")
+def youtube_model(assets: dict[str, Any]) -> Any:
+    """一条 YouTube 观看页样本。"""
+    result = make_result(
+        title="如果 Ex-Aid 的主题曲被用在名侦探光之美少女里",
+        text=None,
+        url="https://youtu.be/2sm0UuaOm_s",
+        platform="youtube",
+        display_name="YouTube",
+        author=("コズまげch", "@kozumage"),
+        extra={
+            "stats_line": "\U0001f440 12.3万 \U0001f44d 8547 \U0001f4ac 453",
+            "hot_comments": [
+                {
+                    "username": "热评用户甲",
+                    "uid": "10001",
+                    "likes": 41,
+                    "time": "3天前",
+                    "message": "第一条公开评论内容。",
+                },
+            ],
+        },
+    )
+    return build_model(
+        result,
+        {
+            "avatar": assets["avatar"],
+            "hero": None,
+            "grid": [assets["wide"]],
+            "comment_avatars": {0: assets["avatar"]},
+        },
+        watermark="Alice解析",
+    )
+
+
+def test_auto_theme_follows_the_link_platform() -> None:
+    """"跟随平台"哨兵要能被识别，并按平台落到对应仿站皮肤；未收录平台退回极光。"""
+    assert is_auto_theme(AUTO_THEME_KEY)
+    assert is_auto_theme("跟随平台")
+    assert not is_auto_theme("bilibili")
+
+    assert resolve_theme_key_for_platform(AUTO_THEME_KEY, "bilibili") == "bilibili"
+    assert resolve_theme_key_for_platform(AUTO_THEME_KEY, "twitter") == "x"
+    assert resolve_theme_key_for_platform(AUTO_THEME_KEY, "x") == "x"
+    assert resolve_theme_key_for_platform(AUTO_THEME_KEY, "youtube") == "youtube"
+    # 没有专属仿站皮肤的平台不能落到 THEMES 之外，也不能报错。
+    assert resolve_theme_key_for_platform(AUTO_THEME_KEY, "pixiv") == "aurora"
+    assert resolve_theme_key_for_platform(AUTO_THEME_KEY, "") == "aurora"
+    # 用户明确选了皮肤时，平台一律不参与决策。
+    assert resolve_theme_key_for_platform("nocturne", "twitter") == "nocturne"
+    assert PLATFORM_THEMES["youtube"] in THEMES
+
+
+@pytest.mark.parametrize(
+    ("skin_value", "platform", "expected"),
+    (
+        ("跟随平台", "bilibili", "bilibili"),
+        ("auto", "twitter", "x"),
+        ("跟随平台", "x", "x"),
+        ("跟随平台", "youtube", "youtube"),
+        ("跟随平台", "weibo", "bilibili"),
+        ("跟随平台", "pixiv", "aurora"),
+        ("nocturne", "bilibili", "nocturne"),
+        ("哔哩哔哩", "pixiv", "bilibili"),
+    ),
+)
+def test_renderer_hands_the_auto_sentinel_to_the_engine(
+    tmp_path: Path, skin_value: str, platform: str, expected: str
+) -> None:
+    """ShareCardRenderer 不能把「跟随平台」提前归一掉。
+
+    这是一条真实回归：曾经 __init__ 里直接调 resolve_theme_key(skin)，它不认识
+    auto 哨兵，于是兜底成极光——用户选了"跟随平台"却只拿到极光皮肤 + 平台强调色。
+    所以这里必须从 renderer 一路断言到 build_context 定下的 theme.key。
+    """
+    renderer = ShareCardRenderer(cache_dir=tmp_path, skin=skin_value, width=520)
+    if is_auto_theme(skin_value):
+        assert renderer.skin_name == AUTO_THEME_KEY
+    else:
+        assert renderer.skin_name in THEME_KEYS
+
+    model = build_model(
+        make_result(platform=platform, display_name=platform),
+        {"avatar": None, "hero": None, "grid": []},
+    )
+    ctx = card_engine.build_context(model, width=520, theme_key=renderer.skin_name)
+    assert ctx.theme.key == expected, (
+        f"skin={skin_value!r} platform={platform!r} 应得到 {expected}，实际 {ctx.theme.key}"
+    )
+
+
+#: 五套通用皮肤（不含 bilibili / x / youtube 三套仿站皮肤）
+GENERIC_THEMES = tuple(k for k in THEME_KEYS if k not in ("bilibili", "x", "youtube"))
+
+
+@pytest.mark.parametrize("layout", LAYOUT_KEYS)
+@pytest.mark.parametrize("theme", GENERIC_THEMES)
+def test_generic_skins_drop_platform_badge_and_type_tag(
+    rich_model: Any, theme: str, layout: str
+) -> None:
+    """通用皮肤的左上角不再贴平台徽章与「视频 / 图文」标签。
+
+    站点身份由页脚的完整链接表达，内容类型由媒体区块本身表达；两者都堆在标题
+    上方只会把卡片顶部变成标签墙。眉标退化为「记号 + 发布时间」，时间必须还在。
+    """
+    probe = render_probe(rich_model, width=MATRIX_WIDTH, theme_key=theme, layout_key=layout)
+
+    assert "推特" not in probe.texts, f"{theme}/{layout} 仍在画平台徽章：{probe.texts}"
+    assert "图文" not in probe.texts, f"{theme}/{layout} 仍在画内容类型标签：{probe.texts}"
+    stamp = rich_model.time_text
+    assert stamp
+    assert any(stamp in text for text in probe.texts), (
+        f"{theme}/{layout} 去掉徽章后连发布时间都没了：{probe.texts}"
+    )
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ("heart", "check", "repost", "export", "bookmark", "comment", "sort", "play"),
+)
+def test_chrome_glyphs_actually_draw_something(kind: str) -> None:
+    """操作栏与角标用到的图标必须真的画出像素，别悄悄留一枚空白方块。"""
+    canvas = Image.new("RGBA", (24, 24), (0, 0, 0, 0))
+    card_surface.glyph(canvas, (2, 2, 22, 22), kind, (255, 255, 255, 255))
+
+    histogram = canvas.getchannel("A").histogram()
+    painted = sum(histogram[1:])
+    assert painted > 20, f"{kind} 图标几乎没画出东西（painted={painted}）"
+    # 图标不能糊成一整个实心块，否则 20px 下就是个方点。
+    assert painted < 24 * 24 * 0.85, f"{kind} 图标糊成实心块（painted={painted}）"
+
+
+def test_x_chrome_swaps_furniture_for_the_platform(x_model: Any) -> None:
+    """X 卡片的家具必须换成 X 自己的：@handle 副行、单条分隔线、"回复 / 相关"。"""
+    probe = render_probe(x_model, width=800, theme_key="auto", layout_key="feed")
+    joined = probe.joined_text
+
+    # 身份副行给 @handle，而不是 B 站那样的发布时间。
+    assert "@precure_movie" in probe.texts
+    # 页签条退化成一条 hairline，不再画 B 站的"评论 N / 赞和转发 M"。
+    assert "赞和转发" not in joined, f"X 卡片不该出现 B 站页签：{probe.texts}"
+    assert "评论 33" not in probe.texts
+    # 评论区标题与排序入口用 X 的措辞。
+    assert "回复" in probe.texts
+    assert "相关" in probe.texts
+    assert "热门评论" not in joined
+    # 输入框占位与 B 站不同。
+    assert "发布你的回复" in probe.texts
+    assert "点我发评论" not in joined
+
+
+@pytest.mark.parametrize("theme", ("bilibili", "x", "youtube"))
+def test_x_furniture_keeps_its_own_brand_colors(x_model: Any, theme: str) -> None:
+    """X 的家具自带配色：已赞粉心与蓝勾角标不许被皮肤的辅助强调色染掉。
+
+    这是一条真实回归：心形原先取 ctx.accent_alt，于是「哔哩哔哩皮肤 + X 家具」
+    把 X 的粉心画成了 B 站蓝；蓝勾同理。家具属于平台，与皮肤无关。
+    """
+    probe = render_probe(x_model, width=800, theme_key=theme, layout_key="feed")
+    palette = {px for px in probe.image.convert("RGB").getdata()}
+
+    assert card_blocks.X_LIKE_PINK in palette, f"{theme} 皮肤下 X 的已赞心形被染色了"
+    assert card_blocks.X_VERIFIED_BLUE in palette, f"{theme} 皮肤下 X 的认证角标被染色了"
+
+
+def test_x_chrome_time_row_leads_with_time_and_says_views(x_model: Any) -> None:
+    """X 的时间行是"时间 · N 查看"，"浏览"这种 B 站说法不能出现。"""
+    probe = render_probe(x_model, width=800, theme_key="auto", layout_key="feed")
+
+    line = [t for t in probe.texts if "查看" in t]
+    assert line, f"X 卡片应有「N 查看」行：{probe.texts}"
+    assert "·" in line[0], f"时间应前置并用间隔点连接：{line[0]!r}"
+    assert line[0].split("·")[0].strip()[:2].isdigit(), f"时间没有前置：{line[0]!r}"
+    assert "浏览" not in probe.joined_text
+    assert "弹幕" not in probe.joined_text
+
+
+def test_x_cover_has_no_view_count_badge(x_model: Any) -> None:
+    """X 的图片不压播放量角标（那是 B 站的东西），数值只在时间行出现一次。"""
+    probe = render_probe(x_model, width=800, theme_key="auto", layout_key="feed")
+
+    assert "12.3万" not in probe.texts, "封面角标不该单独画出播放量"
+
+
+def test_x_comments_use_inline_action_row(x_model: Any) -> None:
+    """X 的回复是"名字 · 时间"一行 + 正文下方的迷你操作行，不是右上角一枚赞。"""
+    probe = render_probe(x_model, width=800, theme_key="auto", layout_key="feed")
+
+    assert "热评用户甲 · 8月22日 江苏" in probe.texts
+    assert not [t for t in probe.texts if t.endswith(" 回复")], (
+        f"X 回复不该再画 B 站的「时间 回复」行：{probe.texts}"
+    )
+
+
+def test_x_action_bar_spreads_across_the_content_row(x_model: Any) -> None:
+    """spread 操作栏要横向铺满一整行：首枚靠左、末枚不溢出右缘、数值从左到右递增。"""
+    width = 800
+    probe = render_probe(x_model, width=width, theme_key="auto", layout_key="feed")
+
+    # 操作栏画在整张卡片最靠下的位置，取每个数值最后一次绘制的 x。
+    wanted = ("33", "208", "361", "876")
+    spots: list[tuple[str, int]] = []
+    for value in wanted:
+        hits = [(x, y) for text, x, y, _ in probe.draws if text == value]
+        assert hits, f"操作栏丢了数值 {value}：{probe.texts}"
+        bottom = max(hits, key=lambda item: item[1])
+        spots.append((value, bottom[0]))
+
+    xs = [x for _, x in spots]
+    assert xs == sorted(xs), f"操作栏数值没有从左到右排开：{spots}"
+    assert xs[0] < width * 0.25, f"首枚动作没有贴左：{spots}"
+    assert xs[-1] < width * 0.95, f"末枚动作溢出了右缘：{spots}"
+    # 均匀铺满：相邻间距不能差出一倍以上。
+    gaps = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
+    assert min(gaps) > 0
+    assert max(gaps) <= min(gaps) * 2.2, f"操作栏间距不均匀：{gaps}"
+
+
+def test_youtube_chrome_uses_native_comment_wording(youtube_model: Any) -> None:
+    """YouTube 评论区说"评论 / 排序依据"，输入框说"添加评论…"。"""
+    probe = render_probe(youtube_model, width=800, theme_key="auto", layout_key="feed")
+
+    assert "评论" in probe.texts
+    assert "排序依据" in probe.texts
+    assert "添加评论…" in probe.texts
+    assert "热门评论" not in probe.joined_text
+    assert "按热度" not in probe.joined_text
+    assert "赞和转发" not in probe.joined_text
+
+
+def test_site_skins_keep_url_and_watermark_in_the_top_bar(x_model: Any) -> None:
+    """仿站皮肤把链接与署名收在顶栏右上角，底部让给原版操作栏。"""
+    for theme in SITE_THEME_KEYS:
+        probe = render_probe(x_model, width=800, theme_key=theme, layout_key="feed")
+        merged = [t for t in probe.texts if "Alice解析" in t]
+        assert merged, f"{theme} 没画出署名：{probe.texts}"
+        assert "x.com/precure_movie" in merged[0], f"{theme} 顶栏没合并原链接：{merged[0]!r}"

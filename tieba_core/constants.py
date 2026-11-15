@@ -1,0 +1,54 @@
+"""常量与默认配置定义。"""
+
+import os
+
+
+class Config:
+    """配置常量类，包含下载、解析等功能的配置参数"""
+
+    DEFAULT_TIMEOUT = 30
+    VIDEO_SIZE_CHECK_TIMEOUT = 10
+    IMAGE_DOWNLOAD_TIMEOUT = 10
+    VIDEO_DOWNLOAD_TIMEOUT = 300
+
+    DEFAULT_LARGE_VIDEO_THRESHOLD_MB = 100.0
+    MAX_LARGE_VIDEO_THRESHOLD_MB = 100.0
+    # 平台单条视频可发送体积上限：QQ 富媒体通道（Highway）对超大视频会在
+    # 上传中途返回 102902 直接拒收，下载再久也白费，因此在取流/下载阶段就
+    # 按这个上限止损，超限只发信息与封面。0 表示不限制。
+    DEFAULT_SEND_VIDEO_MAX_MB = 48.0
+    # 旧配置键仍作为压缩总开关使用；压缩触发条件与参数由独立策略控制。
+    DEFAULT_TRANSCODE_OVERSIZE_VIDEO = True
+    DEFAULT_TRANSCODE_TIMEOUT_SECONDS = 600
+    MIN_TRANSCODE_TIMEOUT_SECONDS = 30
+    MAX_TRANSCODE_TIMEOUT_SECONDS = 3600
+    DEFAULT_GROUP_FILE_TIMEOUT_SECONDS = 600
+    MIN_GROUP_FILE_TIMEOUT_SECONDS = 30
+    MAX_GROUP_FILE_TIMEOUT_SECONDS = 3600
+    DOWNLOAD_RETRY_ATTEMPTS = 3
+    DOWNLOAD_RETRY_BASE_DELAY = 0.5
+
+    STREAM_DOWNLOAD_CHUNK_SIZE = 2 * 1024 * 1024
+
+    RANGE_DOWNLOAD_CHUNK_SIZE = 2 * 1024 * 1024
+    RANGE_DOWNLOAD_MAX_CONCURRENT = 8
+
+    M3U8_MAX_CONCURRENT_SEGMENTS = 10
+
+    DOWNLOAD_MANAGER_MAX_CONCURRENT = 5
+    PARSER_MAX_CONCURRENT = 10
+
+    PLUGIN_NAME = "astrbot_plugin_tieba_nova"
+    CACHE_DIR_NAME = "cache"
+    RUNTIME_DIR_NAME = "tieba_nova_runtime"
+    DEFAULT_CACHE_DIR = "/app/sharedFolder/tieba_nova/cache"
+
+    @staticmethod
+    def build_cache_dir(prefix: str) -> str:
+        """基于运行环境前缀生成统一的媒体缓存目录。"""
+        return os.path.abspath(os.path.join(prefix, Config.CACHE_DIR_NAME))
+
+    @staticmethod
+    def build_runtime_dir(cache_dir: str, *parts: str) -> str:
+        """基于媒体缓存目录生成统一的运行时文件目录。"""
+        return os.path.abspath(os.path.join(cache_dir, Config.RUNTIME_DIR_NAME, *parts))

@@ -1,0 +1,908 @@
+{
+  "parsers": {
+    "description": "贴吧输出模式",
+    "type": "object",
+    "hint": "关闭时不解析贴吧。仅文本时不获取帖内媒体，卡片展示另由下方设置控制；仅富媒体时不附加楼层回复。",
+    "items": {
+      "tieba": {
+        "description": "贴吧",
+        "type": "string",
+        "options": [
+          "关闭",
+          "全部发送",
+          "仅文本",
+          "仅富媒体"
+        ],
+        "default": "全部发送"
+      }
+    }
+  },
+  "trigger": {
+    "description": "触发设置",
+    "type": "object",
+    "items": {
+      "auto_parse": {
+        "description": "自动解析链接",
+        "type": "bool",
+        "default": true
+      },
+      "reply_trigger": {
+        "description": "回复触发解析",
+        "type": "bool",
+        "hint": "引用含链接的消息并附关键词即可触发解析；与自动解析可同时开启。",
+        "default": false
+      },
+      "keywords": {
+        "description": "手动触发关键词",
+        "type": "list",
+        "hint": "自动解析关闭时用于普通消息；启用“回复触发解析”时也用于引用消息。消息包含任一关键词才触发；每项填写一个关键词。",
+        "items": {
+          "type": "string"
+        },
+        "default": [
+          "贴吧解析",
+          "解析贴吧"
+        ]
+      }
+    }
+  },
+  "parse_rate_limit": {
+    "description": "解析频率限制",
+    "type": "object",
+    "hint": "最多解析次数填 0 表示不限制；启用限制时，时间窗必须大于 0。记录会持久化到插件运行时目录并自动裁剪。",
+    "items": {
+      "same_link": {
+        "description": "同链接限制",
+        "type": "object",
+        "hint": "链接会先清洗为标准链接，过滤分享者、来源和追踪参数后再计数。",
+        "items": {
+          "max_count": {
+            "description": "最多解析次数",
+            "type": "int",
+            "hint": "同一标准链接在时间窗内最多解析的次数；0 = 不限制",
+            "default": 0
+          },
+          "window_seconds": {
+            "description": "时间窗秒数",
+            "type": "int",
+            "hint": "必须大于 0；填 0 会关闭此限制。只统计该秒数内的记录，也用于自动裁剪持久化记录。",
+            "default": 3600
+          }
+        }
+      },
+      "same_user": {
+        "description": "同用户限制",
+        "type": "object",
+        "hint": "按消息发送者 ID 计数；一条消息内解析多个链接会分别计数。",
+        "items": {
+          "max_count": {
+            "description": "最多解析次数",
+            "type": "int",
+            "hint": "同一用户在时间窗内最多解析的链接数；0 = 不限制",
+            "default": 0
+          },
+          "window_seconds": {
+            "description": "时间窗秒数",
+            "type": "int",
+            "hint": "必须大于 0；填 0 会关闭此限制。只统计该秒数内的记录，也用于自动裁剪持久化记录。",
+            "default": 3600
+          }
+        }
+      }
+    }
+  },
+  "message": {
+    "description": "消息输出",
+    "type": "object",
+    "hint": "按文本元数据、富媒体、附加内容和发送行为分区；字段开关只影响展示，不隐藏错误与媒体状态。",
+    "items": {
+      "text_metadata": {
+        "description": "文本元数据",
+        "type": "object",
+        "hint": "分别控制解析摘要中的来源字段；关闭字段也不会影响解析、下载或错误提示。",
+        "items": {
+          "show_title": {
+            "description": "显示标题",
+            "type": "bool",
+            "default": true
+          },
+          "show_author": {
+            "description": "显示作者",
+            "type": "bool",
+            "default": true
+          },
+          "show_timestamp": {
+            "description": "显示发布时间",
+            "type": "bool",
+            "default": true
+          },
+          "show_original_link": {
+            "description": "显示原始链接",
+            "type": "bool",
+            "hint": "关闭后不在解析结果中重复展示原链接。",
+            "default": true
+          },
+          "show_description": {
+            "description": "显示简介/正文",
+            "type": "bool",
+            "hint": "适合正文较长、只希望保留简短摘要的群聊。",
+            "default": true
+          },
+          "quote_user_message": {
+            "description": "引用用户消息",
+            "type": "bool",
+            "hint": "仅普通逐条发送时生效；聚合和 ZIP 不引用。只让文本元数据节点引用对应用户消息，媒体节点不引用。",
+            "default": false
+          }
+        }
+      },
+      "media_display": {
+        "description": "富媒体展示",
+        "type": "object",
+        "items": {
+          "video_cover_only": {
+            "description": "视频仅发送封面",
+            "type": "bool",
+            "hint": "开启后不发送视频节点；每个视频会改为发送封面图片。解析结果有封面时直接使用封面，否则尝试截取视频第一帧。",
+            "default": false
+          }
+        }
+      },
+      "card_render": {
+        "description": "附加内容：卡片渲染",
+        "type": "object",
+        "hint": "默认发送内容卡片，并包含首批楼层回复；可选择卡片与文本同时发送、分开发送，或仅发送卡片。",
+        "items": {
+          "enable": {
+            "description": "启用卡片渲染",
+            "type": "bool",
+            "hint": "依赖 Pillow；渲染失败自动回退纯文本",
+            "default": true
+          },
+          "mode": {
+            "description": "卡片模式",
+            "type": "string",
+            "options": [
+              "卡片+文本同条发送",
+              "卡片+文本分开发",
+              "仅卡片"
+            ],
+            "hint": "这是卡片与普通文本发送方式的唯一开关。同条发送：卡片图和第一段文本位于同一消息链，超长文本按平台限制续发；分开发：卡片图单独发送；仅卡片：不发送普通文本，只随卡片保留原始链接。",
+            "default": "仅卡片"
+          },
+          "custom_font": {
+            "description": "自定义字体路径",
+            "type": "string",
+            "hint": "留空使用内置字体（恒宋云朗黑体）；支持 .ttf/.otf/.ttc",
+            "default": ""
+          },
+          "theme": {
+            "description": "深浅配色",
+            "type": "string",
+            "options": [
+              "深色",
+              "浅色"
+            ],
+            "hint": "对所有可选皮肤都生效：7 套皮肤各自都有深色与浅色配色，本项会改变背景、文字与面板颜色。深浅（2）× 皮肤（7）× 布局（4）共 56 种组合。",
+            "default": "深色"
+          },
+          "layout": {
+            "description": "版式布局",
+            "type": "string",
+            "options": [
+              "标准",
+              "杂志",
+              "沉浸式",
+              "信息流"
+            ],
+            "hint": "对所有风格都生效：布局只改变区块的空间组织方式，与皮肤、深浅配色自由组合。标准 = 单栏顺序排布；杂志 = 左右分栏，作者、数据与引用移入侧栏；沉浸式 = 全幅大图压标题、标题更大；信息流 = 紧凑单栏、多图拼贴、字号更小。",
+            "default": "标准"
+          },
+          "skin": {
+            "description": "卡片风格",
+            "type": "string",
+            "options": [
+              "极光",
+              "报章",
+              "测控",
+              "展陈",
+              "夜曲",
+              "贴吧帖子",
+              "简洁消息",
+              "跟随平台"
+            ],
+            "hint": "7 套皮肤：极光、报章、测控、展陈、夜曲、贴吧帖子、简洁消息。跟随平台会使用贴吧帖子布局。",
+            "default": "极光"
+          },
+          "width": {
+            "description": "卡片宽度",
+            "type": "int",
+            "hint": "范围 520-1080 像素",
+            "default": 800
+          },
+          "cover_full_size": {
+            "description": "封面全尺寸",
+            "type": "bool",
+            "hint": "开启后按封面原始宽高比展示（不裁切为固定高度）",
+            "default": false
+          },
+          "show_play_button": {
+            "description": "封面播放按钮",
+            "type": "bool",
+            "hint": "开启后在视频封面中央显示播放按钮",
+            "default": false
+          },
+          "watermark": {
+            "description": "卡片署名文案",
+            "type": "string",
+            "hint": "留空使用 Nova解析；最多 32 个字符。显示位置由皮肤决定（哔哩哔哩皮肤在右上角，其余皮肤在页脚）。",
+            "default": "贴吧Nova"
+          },
+          "show_watermark": {
+            "description": "显示卡片署名",
+            "type": "bool",
+            "hint": "关闭后所有皮肤都不再绘制署名水印。",
+            "default": true
+          },
+          "show_url": {
+            "description": "显示原文链接",
+            "type": "bool",
+            "hint": "关闭后所有皮肤都不再在卡片上绘制来源链接。",
+            "default": true
+          },
+          "include_hot_comments": {
+            "description": "热评合并到卡片",
+            "type": "bool",
+            "hint": "开启后，把已获取的热评追加到同一张卡片中；卡片最多展示前 5 条。是否另外发送热评文本由“在普通文本中显示热评”决定。",
+            "default": true
+          },
+          "hot_comment_max_chars": {
+            "description": "卡片单条热评字数上限",
+            "type": "int",
+            "hint": "范围 60-600，默认 180。插件会先按此上限截断过长热评，再把保留内容完整换行显示，避免固定三行造成突兀截断。",
+            "default": 180
+          }
+        }
+      },
+      "hot_comments": {
+        "description": "内容展示：首批楼层回复",
+        "type": "object",
+        "hint": "从首屏可见楼层中展示回复及实际楼层号，并非全帖热度排名。图片和视频回复以数量摘要展示。",
+        "items": {
+          "count": {
+            "description": "热评条数",
+            "type": "int",
+            "hint": "0–50。0 不附加楼层回复；默认显示 3 条，卡片最多展示 5 条。",
+            "default": 3
+          },
+          "show_in_text": {
+            "description": "在普通文本中显示热评",
+            "type": "bool",
+            "hint": "关闭后，热评不会作为普通文本发送，但仍可参与翻译，并可在开启“热评合并到卡片”后只显示在卡片中。卡片模式仍负责卡片与普通文本的整体发送关系。",
+            "default": false
+          },
+          "tieba": {
+            "description": "贴吧回帖",
+            "type": "bool",
+            "hint": "从首批可见楼层中选择回复并标明楼层，非全帖热榜。条数为 0 或平台设为仅富媒体时不附加回复。",
+            "default": true
+          }
+        }
+      },
+      "opening": {
+        "description": "发送行为：开场语",
+        "type": "object",
+        "hint": "仅在存在可发送的富媒体时发送；仅文本结果或媒体全部失败时不会发送。",
+        "items": {
+          "enable": {
+            "description": "发送开场语",
+            "type": "bool",
+            "default": true
+          },
+          "content": {
+            "description": "开场语内容",
+            "type": "string",
+            "condition": {
+              "enable": true
+            },
+            "default": "贴吧内容解析"
+          }
+        }
+      },
+      "packing": {
+        "description": "发送行为：消息聚合",
+        "type": "object",
+        "hint": "控制是否使用合并转发消息；ZIP 归档独立于此设置。NapCat 存在兼容问题，请按需启用。",
+        "items": {
+          "mode": {
+            "description": "聚合模式",
+            "type": "string",
+            "options": [
+              "不聚合",
+              "全部聚合",
+              "按条件聚合"
+            ],
+            "default": "不聚合"
+          },
+          "zip_command": {
+            "description": "旧归档命令（自动迁移）",
+            "type": "string",
+            "default": "",
+            "invisible": true
+          },
+          "thresholds": {
+            "description": "按条件聚合阈值",
+            "type": "object",
+            "hint": "仅在选择“按条件聚合”时生效；0 = 不按该项触发。",
+            "condition": {
+              "mode": "按条件聚合"
+            },
+            "items": {
+              "image_count": {
+                "description": "图片数量",
+                "type": "int",
+                "hint": "图片总数达到该值时聚合；0 = 不按图片数触发",
+                "default": 3
+              },
+              "video_count": {
+                "description": "视频数量",
+                "type": "int",
+                "hint": "视频总数达到该值时聚合；0 = 不按视频数触发",
+                "default": 2
+              },
+              "node_count": {
+                "description": "节点数量",
+                "type": "int",
+                "hint": "文本、图片和视频节点总数达到该值时聚合；0 = 不按节点数触发",
+                "default": 5
+              }
+            }
+          }
+        }
+      },
+      "archive": {
+        "description": "导出行为：ZIP 归档",
+        "type": "object",
+        "hint": "ZIP 归档与聊天消息聚合相互独立。",
+        "items": {
+          "command": {
+            "description": "引用链接归档命令",
+            "type": "string",
+            "hint": "引用含可解析链接的消息并单独发送此命令，将解析详情和可下载媒体导出为 ZIP；留空关闭。命令不能与清缓存命令相同。",
+            "default": ""
+          },
+          "max_total_size_mb": {
+            "description": "归档媒体总大小上限（MB）",
+            "type": "float",
+            "hint": "仅在填写归档命令后有作用。所有待归档媒体总大小超过该值时拒绝创建 ZIP；有效范围 1–4096 MB。",
+            "default": 1024.0
+          }
+        }
+      }
+    }
+  },
+  "translation": {
+    "description": "文本翻译",
+    "type": "object",
+    "hint": "默认关闭。启用后翻译正文/标题；翻译失败不会影响媒体解析。未启用时下面的翻译参数会被忽略。",
+    "items": {
+      "enable": {
+        "description": "启用翻译",
+        "type": "bool",
+        "default": false
+      },
+      "content_scope": {
+        "description": "翻译范围",
+        "type": "string",
+        "condition": {
+          "enable": true
+        },
+        "options": [
+          "仅正文",
+          "正文和标题"
+        ],
+        "hint": "仅正文只翻译简介/正文；正文和标题会同时翻译标题和简介/正文。只要解析结果带有热评，热评正文会一并翻译。仅启用翻译后生效。",
+        "default": "正文和标题"
+      },
+      "apply_scope": {
+        "description": "译文应用范围",
+        "type": "string",
+        "condition": {
+          "enable": true
+        },
+        "options": [
+          "仅卡片使用译文",
+          "卡片和文本均使用译文"
+        ],
+        "hint": "只决定译文替换哪些展示内容，不决定是否发送普通文本。仅卡片使用译文：卡片显示译文，普通文本保留原文；卡片和文本均使用译文：卡片与普通文本都显示译文。普通文本是否发送由“卡片模式”决定。",
+        "default": "卡片和文本均使用译文"
+      },
+      "output_mode": {
+        "description": "旧译文应用范围（自动迁移）",
+        "type": "string",
+        "default": "",
+        "invisible": true
+      },
+      "target_language": {
+        "description": "目标语言",
+        "type": "string",
+        "condition": {
+          "enable": true
+        },
+        "options": [
+          "简体中文",
+          "繁体中文",
+          "English",
+          "日本語",
+          "한국어",
+          "Español",
+          "Français",
+          "Deutsch",
+          "Русский",
+          "Português"
+        ],
+        "default": "简体中文"
+      },
+      "llm": {
+        "description": "大模型接口",
+        "type": "object",
+        "condition": {
+          "enable": true
+        },
+        "items": {
+          "provider_source": {
+            "description": "大模型提供商",
+            "type": "string",
+            "options": [
+              "AstrBot 内置提供商",
+              "插件自定义提供商"
+            ],
+            "hint": "仅启用翻译后生效。选择 AstrBot 已配置的 LLM，或使用本插件独立配置的 OpenAI 兼容接口。",
+            "default": "AstrBot 内置提供商"
+          },
+          "astrbot_provider": {
+            "description": "AstrBot 内置提供商",
+            "type": "object",
+            "hint": "当“大模型提供商”选择 AstrBot 内置提供商时生效",
+            "condition": {
+              "provider_source": "AstrBot 内置提供商"
+            },
+            "items": {
+              "provider_id": {
+                "description": "选择 AstrBot AI",
+                "type": "string",
+                "hint": "点击按钮选择 AstrBot 中已配置的 LLM；留空时尝试使用当前会话正在使用的 LLM",
+                "_special": "select_provider",
+                "default": ""
+              }
+            }
+          },
+          "temperature": {
+            "description": "采样温度",
+            "type": "float",
+            "hint": "0 = 最稳定的直译，数值越大越自由；范围 0.0-2.0，默认 0.0。部分模型不支持该参数时会自动去掉重试。",
+            "default": 0.0
+          },
+          "max_completion_tokens": {
+            "description": "单次回复最大 token 数",
+            "type": "int",
+            "hint": "限制模型单次译文长度；范围 256-32000，默认 4000。过小会导致长正文译文被截断。",
+            "default": 4000
+          },
+          "request_timeout_seconds": {
+            "description": "请求超时（秒）",
+            "type": "int",
+            "hint": "单次翻译请求的等待上限；范围 10-600，默认 60。超时后放弃翻译并保留原文，不影响媒体解析。",
+            "default": 60
+          },
+          "max_text_chars_per_request": {
+            "description": "单次请求最大字符数",
+            "type": "int",
+            "hint": "超过该长度的文本会被切分成多次请求；范围 500-20000，默认 4000。",
+            "default": 4000
+          },
+          "custom_provider": {
+            "description": "自定义提供商",
+            "type": "object",
+            "hint": "当“大模型提供商”选择插件自定义提供商时生效",
+            "condition": {
+              "provider_source": "插件自定义提供商"
+            },
+            "items": {
+              "provider": {
+                "description": "厂商/接口类型",
+                "type": "string",
+                "options": [
+                  "自定义 OpenAI 兼容",
+                  "OpenAI",
+                  "DeepSeek",
+                  "Moonshot / Kimi",
+                  "阿里云百炼 / 通义千问",
+                  "智谱 AI / GLM",
+                  "火山引擎方舟 / 豆包",
+                  "OpenRouter",
+                  "SiliconFlow",
+                  "Ollama"
+                ],
+                "default": "自定义 OpenAI 兼容"
+              },
+              "base_url": {
+                "description": "Base URL",
+                "type": "string",
+                "hint": "预设厂商可留空；自定义 OpenAI 兼容、中转或私有部署请填写对应接口地址。仅选择“插件自定义提供商”时生效。",
+                "default": ""
+              },
+              "api_key": {
+                "description": "API Key",
+                "type": "string",
+                "hint": "仅本地使用，不会写入运行日志；仅选择“插件自定义提供商”时生效。",
+                "default": ""
+              },
+              "model": {
+                "description": "模型",
+                "type": "string",
+                "hint": "填写所选厂商的模型名，例如 deepseek-chat、qwen-plus、gpt-4o-mini 或本地 Ollama 模型；切换厂商不会自动修改此值。",
+                "default": "gpt-5.5"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "download": {
+    "description": "下载与缓存",
+    "type": "object",
+    "hint": "控制下载并发、大小限制和本地缓存。非 Docker 环境使用 AstrBot 插件数据目录。",
+    "items": {
+      "max_concurrent": {
+        "description": "最大并发下载数",
+        "type": "int",
+        "hint": "建议 3–5；过大可能增加带宽和磁盘压力。硬上限 20，填写更大的值按 20 处理；非法值回落 5。",
+        "default": 5
+      },
+      "cache_dir": {
+        "description": "Docker 共享缓存目录（可选）",
+        "type": "string",
+        "hint": "媒体缓存目录。留空由 AstrBot 插件数据目录管理；Docker 默认 /app/sharedFolder/tieba_nova/cache。请保证路径可写且与 QQ 适配器共享可访问的媒体路径。",
+        "default": ""
+      },
+      "max_video_size_mb": {
+        "description": "视频大小上限（MB）",
+        "type": "float",
+        "hint": "普通视频先预检；DASH/M3U8 下载后按实际大小兜底；填 0 不限制。",
+        "default": 1000.0
+      },
+      "large_video_threshold_mb": {
+        "description": "大视频阈值（MB）",
+        "type": "float",
+        "hint": "超过阈值的普通视频单独发送，不放入消息集合；有效上限 100 MB，填 0 不限制。",
+        "default": 100.0
+      },
+      "send_video_max_mb": {
+        "description": "可发送视频体积上限（MB）",
+        "type": "float",
+        "hint": "普通视频消息的体积边界，单位 MiB。默认 48 为 LLOneBot/QQ Highway 的保守安全值；返回 102902 时通常表示超过当前上传边界。填 0 不限制。压缩策略与超限投递方式分别由下面的配置控制。",
+        "default": 48
+      },
+      "oversize_delivery": {
+        "description": "超限视频投递方式",
+        "type": "string",
+        "options": [
+          "仅发送信息与封面",
+          "上传为文件（群聊/私聊）",
+          "超限直接上传原文件（不压缩）"
+        ],
+        "hint": "超限直接上传原文件：超过普通视频发送上限后直接发送 QQ 群文件/私聊文件，优先于所有压缩设置。原文件仍受下载硬上限限制。原“上传为文件”模式继续先按配置压缩，再回退文件。需要可用缓存和支持文件上传的协议端。",
+        "default": "超限直接上传原文件（不压缩）"
+      },
+      "group_file_timeout_seconds": {
+        "description": "文件上传超时（秒）",
+        "type": "int",
+        "hint": "单个群聊或私聊文件等待上传回执的最长时间，有效范围 30–3600；aiocqhttp 内层等待同步使用此值。超时只表示结果未确认，协议端可能仍在上传，请先查看当前会话。",
+        "default": 600
+      },
+      "transcode_oversize_video": {
+        "description": "启用视频压缩",
+        "type": "bool",
+        "hint": "独立的视频重编码策略。需要宿主安装 ffmpeg，压缩期间会占用 CPU；关闭后不会因为普通发送上限而隐式压缩。 选择“超限直接上传原文件（不压缩）”时忽略所有压缩设置。",
+        "default": false
+      },
+      "transcode_mode": {
+        "description": "压缩触发方式",
+        "type": "string",
+        "options": [
+          "关闭",
+          "超过指定体积",
+          "始终压缩"
+        ],
+        "hint": "超过指定体积只处理命中压缩阈值的视频；始终压缩会重编码每个下载到本地的视频。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": "关闭"
+      },
+      "transcode_trigger_mb": {
+        "description": "压缩触发阈值（MB）",
+        "type": "float",
+        "hint": "仅“超过指定体积”模式使用。填 0 时跟随“可发送视频体积上限”；两者都为 0 时该模式不触发。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 0
+      },
+      "transcode_target_size_mb": {
+        "description": "压缩目标体积（MB）",
+        "type": "float",
+        "hint": "压缩产物的最大目标体积。填 0 时优先跟随普通发送上限；普通发送也不限制时，按源文件的 90% 作为目标。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 0
+      },
+      "transcode_video_codec": {
+        "description": "视频编码器",
+        "type": "string",
+        "options": [
+          "libx264",
+          "libx265",
+          "libsvtav1",
+          "h264_nvenc",
+          "hevc_nvenc"
+        ],
+        "hint": "兼容性优先选 libx264；硬件编码器要求 ffmpeg 和宿主显卡环境支持。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": "libx264"
+      },
+      "transcode_preset": {
+        "description": "编码预设",
+        "type": "string",
+        "hint": "直接传给 ffmpeg 编码器的 preset。libx264 默认 veryfast；不同编码器支持的值不同。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": "veryfast"
+      },
+      "transcode_max_height": {
+        "description": "最大短边分辨率",
+        "type": "int",
+        "hint": "0 为按目标体积自动判断；例如 720 会把横屏限制到 720p、竖屏限制到 720 像素宽。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 0
+      },
+      "transcode_max_fps": {
+        "description": "最大帧率",
+        "type": "float",
+        "hint": "0 为自动；设置后仅限制高于该值的源视频。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 0
+      },
+      "transcode_video_bitrate_kbps": {
+        "description": "固定视频码率（kbps）",
+        "type": "int",
+        "hint": "0 为按目标体积自动计算。填写固定码率后只编码一轮，产物仍必须满足目标体积。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 0
+      },
+      "transcode_audio_bitrate_kbps": {
+        "description": "音频码率（kbps）",
+        "type": "int",
+        "hint": "0 为按目标体积自动选择 64/96/128 kbps；无音轨的视频不会创建音轨。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 0
+      },
+      "transcode_crf": {
+        "description": "CRF 恒定质量值",
+        "type": "int",
+        "hint": "0 为关闭并使用目标体积码率；1–51 会改用 CRF 且只编码一轮，数值越小画质越高、体积越大。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 0
+      },
+      "transcode_max_attempts": {
+        "description": "目标体积尝试次数",
+        "type": "int",
+        "hint": "自动码率模式下产物超限时最多重新收紧几轮，有效范围 1–3。固定码率或 CRF 模式始终只编码一轮。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 2
+      },
+      "transcode_extra_args": {
+        "description": "附加 ffmpeg 参数",
+        "type": "string",
+        "hint": "高级选项，按命令行规则拆分并追加在输出文件前，不经过 shell。可留空；错误参数会导致本次压缩失败并按投递策略回退。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": ""
+      },
+      "transcode_timeout_seconds": {
+        "description": "压缩超时（秒）",
+        "type": "int",
+        "hint": "单条视频压缩的最长耗时，超时按压缩失败处理。有效范围 30–3600；非法值回落 600。",
+        "condition": {
+          "transcode_oversize_video": true
+        },
+        "default": 600
+      }
+    }
+  },
+  "permissions": {
+    "description": "权限控制",
+    "type": "object",
+    "hint": "优先级：管理员 > 个人白名单 > 个人黑名单 > 群组白名单 > 群组黑名单。名单每项填写一个 ID。",
+    "items": {
+      "admin_id": {
+        "description": "管理员 ID",
+        "type": "string",
+        "hint": "最高权限（白名单限制对管理员豁免），接收私聊通知并自动加入白名单。",
+        "default": ""
+      },
+      "whitelist": {
+        "description": "白名单",
+        "type": "object",
+        "hint": "启用但不配置名单会禁止所有非管理员用户；用户和群组字段每项填写一个 ID。",
+        "items": {
+          "enable": {
+            "description": "启用",
+            "type": "bool",
+            "default": false
+          },
+          "user": {
+            "description": "用户",
+            "type": "list",
+            "hint": "用户 ID，每项一个字符串。",
+            "condition": {
+              "enable": true
+            },
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "group": {
+            "description": "群组",
+            "type": "list",
+            "hint": "群组 ID，每项一个字符串。",
+            "condition": {
+              "enable": true
+            },
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          }
+        }
+      },
+      "blacklist": {
+        "description": "黑名单",
+        "type": "object",
+        "hint": "用户和群组字段每项填写一个 ID。",
+        "items": {
+          "enable": {
+            "description": "启用",
+            "type": "bool",
+            "default": false
+          },
+          "user": {
+            "description": "用户",
+            "type": "list",
+            "hint": "用户 ID，每项一个字符串。",
+            "condition": {
+              "enable": true
+            },
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "group": {
+            "description": "群组",
+            "type": "list",
+            "hint": "群组 ID，每项一个字符串。",
+            "condition": {
+              "enable": true
+            },
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          }
+        }
+      }
+    }
+  },
+  "proxy": {
+    "description": "代理设置",
+    "type": "object",
+    "hint": "填写代理地址并开启贴吧代理后，帖子请求与媒体下载使用同一代理。",
+    "items": {
+      "address": {
+        "description": "代理地址",
+        "type": "string",
+        "hint": "格式：http://host:port 或 https://host:port。使用 SOCKS 代理时请填写其 HTTP 转发端口。",
+        "default": ""
+      },
+      "tieba": {
+        "description": "贴吧解析与媒体下载使用代理",
+        "type": "bool",
+        "hint": "需要先填写“代理地址”。",
+        "default": false
+      }
+    }
+  },
+  "admin": {
+    "description": "管理与调试",
+    "type": "object",
+    "items": {
+      "clean_cache_keyword": {
+        "description": "清理缓存关键词",
+        "type": "string",
+        "hint": "管理员发送此关键词清除所有媒体缓存",
+        "default": "清理贴吧媒体"
+      },
+      "debug": {
+        "description": "调试模式",
+        "type": "bool",
+        "hint": "输出完整工作流详细日志",
+        "default": false
+      }
+    }
+  },
+  "tieba": {
+    "description": "贴吧设置",
+    "type": "object",
+    "hint": "解析贴吧帖子的正文、图片、视频与回帖。公开内容优先匿名访问，访问受限时可配置已登录 Cookie。",
+    "items": {
+      "cookie": {
+        "description": "浏览器 Cookie（可选）",
+        "type": "string",
+        "hint": "只用于贴吧请求；请勿公开分享。留空使用匿名访问。",
+        "default": ""
+      }
+    }
+  },
+  "media_relay": {
+    "description": "媒体中转",
+    "type": "object",
+    "hint": "可选媒体中转服务，默认关闭。用于适配器无法直接读取媒体路径的场景；填写插件可访问的回调地址。",
+    "items": {
+      "enable": {
+        "description": "启用",
+        "type": "bool",
+        "hint": "由 AstrBot HTTP 服务中转缓存中的本地媒体文件。",
+        "default": false
+      },
+      "callback_url": {
+        "description": "AstrBot 回调地址",
+        "type": "string",
+        "hint": "留空时使用 AstrBot 全局 callback_api_base；否则填写消息平台可达的地址，如 http://host:6185。跨服务器时需公网可达。",
+        "condition": {
+          "enable": true
+        },
+        "default": ""
+      },
+      "ttl": {
+        "description": "中转缓存有效期（秒）",
+        "type": "int",
+        "hint": "最小 30 秒；到期后链接失效并清理缓存，建议至少 60 秒。",
+        "condition": {
+          "enable": true
+        },
+        "default": 300
+      }
+    }
+  }
+}
