@@ -5,7 +5,7 @@ desc: |
   独立贴吧解析插件，自动识别帖子及移动端分享链接，获取主楼正文、
   原图、视频和首屏楼层回复；支持卡片、翻译、聚合、ZIP 导出及
   超限视频直接发送原文件。配置与缓存独立，可自行选择与 Nova 的启用方式。
-version: v1.0.0
+version: v1.0.1
 astrbot_version: ">=4.25.0,<5"
 author: Whereis-Alice
 repo: https://github.com/Whereis-Alice/astrbot_plugin_tieba_nova
