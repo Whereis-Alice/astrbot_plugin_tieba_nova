@@ -18,6 +18,7 @@ def test_initialize_is_idempotent_and_terminate_closes_clients_once(tmp_path):
         plugin = make_plugin(tmp_path)
         plugin.download_manager.shutdown = AsyncMock()
         plugin.metadata_translator.aclose = AsyncMock()
+        plugin.llm_content_fetcher.aclose = AsyncMock()
         await plugin.initialize()
         task = plugin._expired_cleanup_task
         await plugin.initialize()
@@ -29,6 +30,7 @@ def test_initialize_is_idempotent_and_terminate_closes_clients_once(tmp_path):
         assert plugin._expired_cleanup_task is None
         plugin.download_manager.shutdown.assert_awaited_once()
         plugin.metadata_translator.aclose.assert_awaited_once()
+        plugin.llm_content_fetcher.aclose.assert_awaited_once()
 
     asyncio.run(run())
 

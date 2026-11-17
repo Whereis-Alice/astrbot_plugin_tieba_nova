@@ -4,7 +4,7 @@ import importlib
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -87,7 +87,7 @@ def make_plugin(tmp_path, **overrides):
     }
     for section, value in overrides.items():
         config.setdefault(section, {}).update(value)
-    return main.TiebaNovaPlugin(SimpleNamespace(), config)
+    return main.TiebaNovaPlugin(SimpleNamespace(add_llm_tools=Mock()), config)
 
 
 def fake_network(monkeypatch, plugin, metadata=None, *, all_instances=False):

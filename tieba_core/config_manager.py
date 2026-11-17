@@ -513,6 +513,17 @@ class MediaRelayConfig:
 
 
 @dataclass
+class LLMToolConfig:
+    """内容抓取工具的独立开关与资源限额。"""
+
+    enabled: bool = True
+    max_links: int = 3
+    max_output_chars: int = 24000
+    timeout_seconds: int = 45
+    max_concurrent_calls: int = 2
+
+
+@dataclass
 class TranslationConfig:
     enabled: bool = False
     content_scope: str = "正文和标题"
@@ -554,6 +565,7 @@ class ConfigManager:
                 "trigger": None,
                 "parsers": None,
                 "permissions": None,
+                "llm_tool": None,
             }
         self._migrate_message_config(config)
         self._migrate_translation_config(config)
@@ -601,6 +613,32 @@ class ConfigManager:
                 "自动解析已关闭且未配置任何触发关键词，"
                 "回复触发也已禁用，解析功能将完全不可用"
             )
+
+        # --- LLM content tool ---
+        if "llm_tool" not in config:
+            llm_tool_raw = {}
+        elif isinstance(config.get("llm_tool"), dict):
+            llm_tool_raw = config["llm_tool"]
+        else:
+            logger.warning("llm_tool 配置存在但不是对象，已安全关闭内容抓取工具")
+            llm_tool_raw = {"enabled": False}
+        self.llm_tool = LLMToolConfig(
+            enabled=self._parse_bool(
+                llm_tool_raw.get("enabled", True), False, "llm_tool.enabled"
+            ),
+            max_links=self._parse_llm_tool_limit(
+                llm_tool_raw.get("max_links", 3), 3, 1, 5
+            ),
+            max_output_chars=self._parse_llm_tool_limit(
+                llm_tool_raw.get("max_output_chars", 24000), 24000, 4000, 60000
+            ),
+            timeout_seconds=self._parse_llm_tool_limit(
+                llm_tool_raw.get("timeout_seconds", 45), 45, 5, 120
+            ),
+            max_concurrent_calls=self._parse_llm_tool_limit(
+                llm_tool_raw.get("max_concurrent_calls", 2), 2, 1, 4
+            ),
+        )
 
         # --- parsers/output modes ---
         if "parsers" not in config:
@@ -720,7 +758,7 @@ class ConfigManager:
                     "message.hot_comments.show_in_text",
                 ),
                 tieba=self._parse_bool(
-                    hot_comments.get("tieba", True), True, "message.hot_comments.tieba"
+                    hot_comments.get("tieba", True), False, "message.hot_comments.tieba"
                 ),
             ),
             card_render=CardRenderConfig(
@@ -1176,17 +1214,31 @@ class ConfigManager:
             return 0
         return self.message.hot_comments.count
 
-    def create_parsers(self, *, for_archive: bool = False) -> list:
-        """创建本次解析器；归档保留已启用的媒体和回复，不改共享实例。"""
-        if not self._enable_tieba:
+    def create_parsers(
+        self,
+        *,
+        for_archive: bool = False,
+        for_llm: bool = False,
+        include_media: bool = True,
+        hot_comment_count: int | None = None,
+    ) -> list:
+        """创建独立解析器；工具与归档保留内容，聊天遵守展示选项。"""
+        if not self._enable_tieba or (for_llm and not self.llm_tool.enabled):
             return []
-        _, include_media = self.parser_output.output_for_controller("tieba")
-        hot_comment_count = self._effective_hot_comment_count(
+        _, parser_include_media = self.parser_output.output_for_controller("tieba")
+        parser_comment_count = self._effective_hot_comment_count(
             self.message.hot_comments.tieba, "tieba"
         )
-        if for_archive:
-            include_media = True
-            hot_comment_count = (
+        if for_llm:
+            parser_include_media = include_media
+            parser_comment_count = (
+                self._parse_llm_tool_limit(hot_comment_count, 5, 0, 20)
+                if self.message.hot_comments.tieba
+                else 0
+            )
+        elif for_archive:
+            parser_include_media = True
+            parser_comment_count = (
                 self.message.hot_comments.count
                 if self.message.hot_comments.tieba
                 else 0
@@ -1196,8 +1248,8 @@ class ConfigManager:
                 use_proxy=self.proxy.tieba_use_proxy,
                 proxy_url=self.proxy.address or None,
                 cookie=self.tieba.cookie,
-                include_media=include_media,
-                hot_comment_count=hot_comment_count,
+                include_media=parser_include_media,
+                hot_comment_count=parser_comment_count,
             )
         ]
 
@@ -1324,6 +1376,17 @@ class ConfigManager:
     @staticmethod
     def _parse_bounded_int(value, default: int, minimum: int, maximum: int) -> int:
         """把整数配置夹到 [minimum, maximum]，非法值回落默认值。"""
+        try:
+            parsed = int(value)
+        except (OverflowError, TypeError, ValueError):
+            return default
+        return max(minimum, min(maximum, parsed))
+
+    @staticmethod
+    def _parse_llm_tool_limit(value, default: int, minimum: int, maximum: int) -> int:
+        """工具限额只接受整数或整数字符串，其他类型安全回落。"""
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            return default
         try:
             parsed = int(value)
         except (OverflowError, TypeError, ValueError):

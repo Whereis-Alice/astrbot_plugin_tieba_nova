@@ -17,6 +17,7 @@ POST https://tiebac.baidu.com/c/f/pb/page
 ## 核对来源
 
 - 基线为 [Nova v1.21.0](https://github.com/Whereis-Alice/astrbot_plugin_media_parser_nova/commit/6500bbe80f136f549967f272e4e78ce0494b230a)，独立版不依赖它的安装目录。
+- LLM 工具参考并复用 [Nova v1.22.1](https://github.com/Whereis-Alice/astrbot_plugin_media_parser_nova/commit/917176e8c8462efc6bfacabf0e717fd820d1f958) 的参数、内容过滤及限额实现，在独立贴吧插件中注册为 `tieba_fetch_content`，不读取主插件配置或运行目录。
 - 使用贴吧接口真实响应核对主楼、图文回复、视频签名及删帖错误；单元测试使用可控响应覆盖异常边界。
 - [astrbot_plugin_video_analysis 的贴吧解析器](https://github.com/Foolllll-J/astrbot_plugin_video_analysis/blob/19161ad88f851afd69bfd064db1c3103674063a6/modules/tieba/parser.py)仅用于交叉核对接口路径，未直接复制其解析实现。
 

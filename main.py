@@ -14,6 +14,8 @@ from .tieba_core.config_manager import (
 )
 from .tieba_core.constants import Config
 from .tieba_core.downloader import DownloadManager, create_public_only_connector
+from .tieba_core.llm_fetcher import TiebaContentFetcher
+from .tieba_core.llm_tool import CoreTiebaFetchContentTool
 from .tieba_core.logger import logger
 from .tieba_core.message_adapter.archive_builder import (
     ArchiveSizeLimitError,
@@ -38,6 +40,10 @@ from .tieba_core.storage import (
     register_files_with_token_service,
 )
 from .tieba_core.translation import MetadataTranslator, build_card_metadata_list
+
+
+class TiebaFetchContentTool(CoreTiebaFetchContentTool):
+    """Keep the registered tool owner in the plugin entry module for reloads."""
 
 
 class TiebaNovaPlugin(Star):
@@ -105,6 +111,11 @@ class TiebaNovaPlugin(Star):
             same_user_max_count=rate_limit.same_user.max_count,
             same_user_window_seconds=rate_limit.same_user.window_seconds,
         )
+        self.llm_content_fetcher = TiebaContentFetcher(cfg, self.parse_record_manager)
+        if cfg.llm_tool.enabled:
+            self.context.add_llm_tools(
+                TiebaFetchContentTool(fetcher=self.llm_content_fetcher)
+            )
 
     async def initialize(self) -> None:
         """事件循环就绪后再启动后台任务（__init__ 阶段无运行中的事件循环）。"""
@@ -116,6 +127,7 @@ class TiebaNovaPlugin(Star):
         async with self._termination_lock:
             if self._terminated:
                 return
+            await self.llm_content_fetcher.aclose()
             current = asyncio.current_task()
             tasks = [task for task in self._event_tasks if task is not current]
             for task in tasks:

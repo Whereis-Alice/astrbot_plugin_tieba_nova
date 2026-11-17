@@ -46,6 +46,42 @@
       }
     }
   },
+  "llm_tool": {
+    "description": "LLM 内容抓取工具",
+    "type": "object",
+    "hint": "允许模型读取贴吧正文、作者、楼层回复与媒体地址。回复条数由工具参数决定，省略时读取 5 条，支持 0–20 条；仍遵守贴吧回复开关。遵守平台关闭、用户权限、解析限流、Cookie 与代理设置；聊天文本、卡片和富媒体展示模式不会裁剪工具内容。",
+    "items": {
+      "enabled": {
+        "description": "启用内容抓取工具",
+        "type": "bool",
+        "default": true
+      },
+      "max_links": {
+        "description": "单次最多解析链接数",
+        "type": "int",
+        "hint": "范围 1–5，默认 3。",
+        "default": 3
+      },
+      "max_output_chars": {
+        "description": "单次返回字符上限",
+        "type": "int",
+        "hint": "范围 4000–60000，默认 24000；超出时返回截断标记。",
+        "default": 24000
+      },
+      "timeout_seconds": {
+        "description": "单次抓取超时秒数",
+        "type": "int",
+        "hint": "范围 5–120，默认 45。",
+        "default": 45
+      },
+      "max_concurrent_calls": {
+        "description": "最多同时执行工具调用数",
+        "type": "int",
+        "hint": "范围 1–4，默认 2。",
+        "default": 2
+      }
+    }
+  },
   "parse_rate_limit": {
     "description": "解析频率限制",
     "type": "object",

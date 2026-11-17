@@ -247,6 +247,7 @@ class StandaloneConfigTests(unittest.TestCase):
             {
                 "parsers",
                 "trigger",
+                "llm_tool",
                 "parse_rate_limit",
                 "message",
                 "translation",
